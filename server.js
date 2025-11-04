@@ -67,6 +67,12 @@ async function connectToMongo() {
     await groupOfflineMessagesCollection.createIndex({ recipientPubKey: 1 });
     await groupOfflineMessagesCollection.createIndex({ senderPubKey: 1 });
     await groupOfflineMessagesCollection.createIndex({ groupId: 1 });
+
+    // --- 5. NEW: Group Key Relay Collection ---
+    // This stores E2EE-encrypted symmetric keys for new members
+    groupKeyRelayCollection = db.collection("groupKeyRelay");
+    await groupKeyRelayCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
+    await groupKeyRelayCollection.createIndex({ toPubKey: 1 }); // Index for fast lookups
     
     console.log("✅ Connected successfully to MongoDB Atlas (All collections ready)");
   } catch (err) {
@@ -874,6 +880,101 @@ app.post("/group/update-info", async (req, res) => {
     }
 });
 
+// --- NEW: Endpoint for an ADMIN to ADD a new member ---
+app.post("/group/add-member", async (req, res) => {
+    const { groupId, adminPubKey, newMemberPubKey } = req.body;
+    if (!groupId || !adminPubKey || !newMemberPubKey) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    try {
+        const _id = new ObjectId(groupId);
+        const normalizedAdminKey = normalizeB64(adminPubKey);
+        const normalizedNewMemberKey = normalizeB64(newMemberPubKey);
+
+        // 1. Get group and VERIFY ADMIN
+        const group = await groupsCollection.findOne({ _id });
+        if (!group) {
+            return res.status(404).json({ error: "Group not found." });
+        }
+        if (group.adminPubKey !== normalizedAdminKey) {
+            return res.status(403).json({ error: "You are not the admin of this group." });
+        }
+        
+        // 2. Check if member is already in group
+        if (group.members.some(m => m.pubKey === normalizedNewMemberKey)) {
+            return res.status(409).json({ error: "User is already a member of this group." });
+        }
+
+        // 3. Add the new member to the DB
+        const newMemberObject = {
+            pubKey: normalizedNewMemberKey,
+            joinedAt: new Date(),
+            role: 'member'
+        };
+        const updateResult = await groupsCollection.updateOne(
+            { _id },
+            { $addToSet: { members: newMemberObject } }
+        );
+
+        if (updateResult.modifiedCount === 0) {
+            return res.status(409).json({ error: "Failed to add member, or member already exists." });
+        }
+
+        console.log(`🏛️ Admin ${normalizedAdminKey.slice(0,10)}... added new member ${normalizedNewMemberKey.slice(0,10)}... to group ${groupId}.`);
+
+        // 4. Broadcast to all members that a new member has joined
+        // This will trigger the key exchange on all clients
+        io.to(groupId).emit("member-joined", {
+            groupId: groupId,
+            newMember: newMemberObject // Send the full new member object
+        });
+        
+        // 5. Send a log message
+        io.to(groupId).emit("group-log", {
+            groupId,
+            adminPubKey: normalizedAdminKey,
+            addedPubKey: normalizedNewMemberKey, // Use a new key for this log type
+            ts: Date.now()
+        });
+        
+        res.json({ success: true, message: "Member added." });
+
+    } catch (err) {
+        console.error("group/add-member error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
+
+// --- NEW: Endpoint to relay an E2EE-encrypted symmetric key ---
+app.post("/group/relay-key", async (req, res) => {
+    const { groupId, fromPubKey, toPubKey, encryptedKey } = req.body;
+    if (!groupId || !fromPubKey || !toPubKey || !encryptedKey) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+    
+    try {
+        // We don't need to check membership; we're just a dumb relay.
+        // The E2EE encryption is the security.
+        const keyDoc = {
+            groupId,
+            fromPubKey: normalizeB64(fromPubKey),
+            toPubKey: normalizeB64(toPubKey),
+            encryptedKey, // This is already a base64 string
+            createdAt: new Date(),
+            expireAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14-day TTL
+        };
+        
+        const insertResult = await groupKeyRelayCollection.insertOne(keyDoc);
+        
+        console.log(`📦 Relayed group key stored: ${insertResult.insertedId} from ${fromPubKey.slice(0,10)}... to ${toPubKey.slice(0,10)}...`);
+        res.status(201).json({ success: true, messageId: insertResult.insertedId.toString() });
+
+    } catch (err) {
+        console.error("group/relay-key error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
 
 // --- END: Syrja ID Directory Service (v2) ---
 // --- START: Simple Rate Limiting ---
@@ -973,32 +1074,37 @@ io.on("connection", (socket) => {
         // --- END NEW ---
   
   
-  // --- MODIFIED: Handle client confirmation of message receipt ---
+  // --- MODIFIED: Handle client confirmation of message/key receipt ---
   socket.on("message-delivered", async (data) => {
-      if (!data || !data.id || !data.type) return; // <-- Must have type
+      if (!data || !data.id || !data.type) return;
       if (!socket.data.pubKey) return;
 
       try {
           const _id = new ObjectId(data.id);
           let collectionToUse;
+          let idField = "_id"; // Most collections use _id
+          let recipientField = "recipientPubKey"; // Most collections use this
 
           if (data.type === 'p2p') {
               collectionToUse = offlineMessagesCollection;
           } else if (data.type === 'group') {
               collectionToUse = groupOfflineMessagesCollection;
+          } else if (data.type === 'group-key') { // <-- NEW
+              collectionToUse = groupKeyRelayCollection;
+              recipientField = "toPubKey"; // This collection uses 'toPubKey'
           } else {
               return console.warn(`⚠️ Invalid message-delivered type: ${data.type}`);
           }
 
           const deleteResult = await collectionToUse.deleteOne({
-              _id: _id,
-              recipientPubKey: socket.data.pubKey 
+              [idField]: _id,
+              [recipientField]: socket.data.pubKey 
           });
 
           if (deleteResult.deletedCount === 1) {
-              console.log(`✅ ${data.type} message ${data.id} delivered to ${socket.data.pubKey.slice(0,10)}... and deleted.`);
+              console.log(`✅ ${data.type} packet ${data.id} delivered to ${socket.data.pubKey.slice(0,10)}... and deleted.`);
           } else {
-              console.warn(`⚠️ ${data.type} message ${data.id} delivery confirmation failed (not found, or wrong recipient).`);
+              console.warn(`⚠️ ${data.type} packet ${data.id} delivery confirmation failed (not found, or wrong recipient).`);
           }
       } catch (err) {
            console.error(`Error deleting delivered message ${data.id}:`, err);
@@ -1007,6 +1113,7 @@ io.on("connection", (socket) => {
 
     
   // --- MODIFIED: Client "pull" request for offline messages ---
+  // --- MODIFIED: Client "pull" request for offline messages AND keys ---
   socket.on("check-for-offline-messages", async () => {
       const key = socket.data.pubKey;
       if (!key) return;
@@ -1022,7 +1129,7 @@ io.on("connection", (socket) => {
                       from: msg.senderPubKey,
                       payload: msg.encryptedPayload,
                       sentAt: msg.createdAt,
-                      type: 'p2p' // <-- Add type
+                      type: 'p2p'
                   });
               });
           }
@@ -1034,17 +1141,31 @@ io.on("connection", (socket) => {
               groupMessages.forEach(msg => {
                   socket.emit("offline-message", {
                       id: msg._id.toString(),
-                      from: msg.senderPubKey, // Sender
-                      groupId: msg.groupId, // <-- NEW
+                      from: msg.senderPubKey,
+                      groupId: msg.groupId,
                       payload: msg.encryptedPayload,
                       sentAt: msg.createdAt,
-                      type: 'group' // <-- Add type
+                      type: 'group'
+                  });
+              });
+          }
+          
+          // 3. NEW: Get Relayed Group Keys
+          const keyPackets = await groupKeyRelayCollection.find({ toPubKey: key }).toArray();
+          if (keyPackets.length > 0) {
+              console.log(`🔑 Client ${key.slice(0,10)}... is pulling ${keyPackets.length} GROUP KEYS.`);
+              keyPackets.forEach(packet => {
+                  socket.emit("group-key-relay", {
+                      id: packet._id.toString(), // The DB ID for deletion
+                      groupId: packet.groupId,
+                      fromPubKey: packet.fromPubKey,
+                      encryptedKey: packet.encryptedKey
                   });
               });
           }
 
-          if (p2pMessages.length === 0 && groupMessages.length === 0) {
-               console.log(`📬 Client ${key.slice(0,10)}... pulled messages, 0 found.`);
+          if (p2pMessages.length === 0 && groupMessages.length === 0 && keyPackets.length === 0) {
+               console.log(`📬 Client ${key.slice(0,10)}... pulled messages/keys, 0 found.`);
           }
       } catch (err) {
           console.error(`Error fetching offline messages for ${key.slice(0,10)}:`, err);
