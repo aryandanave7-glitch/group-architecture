@@ -791,6 +791,71 @@ app.post("/group/remove-member", async (req, res) => {
     }
 });
 
+// --- NEW: Endpoint for an admin to ADD a member --- 
+
+app.post("/group/add-member", async (req, res) => {
+    const { groupId, adminPubKey, newMemberPubKey } = req.body;
+    
+    if (!groupId || !adminPubKey || !newMemberPubKey) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    try {
+        const _id = new ObjectId(groupId);
+        const normalizedAdminKey = normalizeB64(adminPubKey);
+        const normalizedMemberKey = normalizeB64(newMemberPubKey);
+
+        // 1. Get the group and VERIFY admin status
+        const group = await groupsCollection.findOne({ _id });
+        if (!group) {
+            return res.status(404).json({ error: "Group not found." });
+        }
+        if (group.adminPubKey !== normalizedAdminKey) {
+            return res.status(403).json({ error: "You are not the admin of this group." });
+        }
+        
+        // 2. Check if member is already in the group
+        if (group.members.some(m => m.pubKey === normalizedMemberKey)) {
+            return res.status(409).json({ error: "User is already a member of this group." });
+        }
+
+        // 3. Add the member to the group's member list
+        const newMember = { pubKey: normalizedMemberKey, joinedAt: new Date() };
+        const updateResult = await groupsCollection.updateOne(
+            { _id },
+            { $push: { members: newMember } }
+        );
+
+        if (updateResult.modifiedCount === 0) {
+            throw new Error("Failed to add member to group document.");
+        }
+
+        console.log(`🏛️ Admin ${normalizedAdminKey.slice(0,10)}... added ${normalizedMemberKey.slice(0,10)}... to group ${groupId}.`);
+
+        // 4. Notify all members (including the new one) that they have joined
+        io.to(groupId).emit("member-added", {
+            groupId: groupId,
+            newMemberPubKey: normalizedMemberKey,
+            addedByPubKey: normalizedAdminKey
+        });
+        
+        // 5. Send a log message
+        io.to(groupId).emit("group-log", {
+            groupId: groupId,
+            adminPubKey: normalizedAdminKey, // Using adminPubKey field
+            addedPubKey: normalizedMemberKey, // Custom field for this log type
+            ts: Date.now()
+        });
+        
+        res.json({ success: true, message: "Member added." });
+
+  } catch (err) {
+      console.error("group/add-member error:", err);
+      res.status(500).json({ error: "Database operation failed." });
+  }
+
+});
+
 // --- NEW: Endpoint for ANY member to update group info (avatar, etc.) ---
 // --- MODIFIED: Endpoint for ANY member to update group info (avatar, name, desc) ---
 app.post("/group/update-info", async (req, res) => {
