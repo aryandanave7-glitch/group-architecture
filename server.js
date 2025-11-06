@@ -508,6 +508,16 @@ app.post("/relay-message", async (req, res) => {
         console.log(`📦 Relayed message stored: ${insertResult.insertedId} from ${senderPubKey.slice(0,10)}... to ${recipientPubKey.slice(0,10)}...`);
         res.status(201).json({ success: true, messageId: insertResult.insertedId.toString(), size: payloadSizeBytes });
 
+        // --- NEW: Live Ping for Offline Message ---
+        // After storing the message, check if the recipient is online
+        const targetSocketId = userSockets[recipientPubKey];
+        if (targetSocketId) {
+            // If they are, send them a "ping" to tell them to pull messages
+            console.log(`PING: Sending 'new-offline-message-waiting' to ${recipientPubKey.slice(0,10)}...`);
+            io.to(targetSocketId).emit("new-offline-message-waiting");
+        }
+        // --- END NEW ---
+
     } catch (err) {
         console.error("relay-message error:", err);
         res.status(500).json({ error: "Database operation failed." });
