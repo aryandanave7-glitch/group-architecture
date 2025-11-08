@@ -1000,7 +1000,7 @@ const presenceSubscriptions = {};
 const socketSubscriptions = {};
 
 // Helper to normalize keys
-function normKey(k){ return (typeof k === 'string') ? k.replace(/\s+/g,'') : k; }
+
 
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
