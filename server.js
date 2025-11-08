@@ -1218,7 +1218,8 @@ io.on("connection", (socket) => {
     });
 
     // --- 3. Reply with the initial online status of the subscribed contacts ---
-    const initialOnlineContacts = contactPubKeys.filter(key => !!userSockets[normKey(key)]);
+    // --- 3. Reply with the initial online status of the subscribed contacts ---
+    const initialOnlineContacts = contactPubKeys.filter(key => !!userSockets[normalizeB64(key)]);
     socket.emit("presence-initial-status", initialOnlineContacts);
   });
 
