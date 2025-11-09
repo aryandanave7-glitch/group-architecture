@@ -508,16 +508,6 @@ app.post("/relay-message", async (req, res) => {
         console.log(`📦 Relayed message stored: ${insertResult.insertedId} from ${senderPubKey.slice(0,10)}... to ${recipientPubKey.slice(0,10)}...`);
         res.status(201).json({ success: true, messageId: insertResult.insertedId.toString(), size: payloadSizeBytes });
 
-        // --- NEW: Live Ping for Offline Message ---
-        // After storing the message, check if the recipient is online
-        const targetSocketId = userSockets[recipientPubKey];
-        if (targetSocketId) {
-            // If they are, send them a "ping" to tell them to pull messages
-            console.log(`PING: Sending 'new-offline-message-waiting' to ${recipientPubKey.slice(0,10)}...`);
-            io.to(targetSocketId).emit("new-offline-message-waiting");
-        }
-        // --- END NEW ---
-
     } catch (err) {
         console.error("relay-message error:", err);
         res.status(500).json({ error: "Database operation failed." });
@@ -1000,7 +990,7 @@ const presenceSubscriptions = {};
 const socketSubscriptions = {};
 
 // Helper to normalize keys
-
+function normKey(k){ return (typeof k === 'string') ? k.replace(/\s+/g,'') : k; }
 
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
@@ -1012,7 +1002,7 @@ io.on("connection", (socket) => {
       return;
     }
     if (!pubKey) return;
-    const key = normalizeB64(pubKey);
+    const key = normKey(pubKey);
     userSockets[key] = socket.id;
     socket.data.pubKey = key; // Store key on socket for later cleanup
     console.log(`🔑 Registered: ${key.slice(0,12)}... -> ${socket.id}`);
@@ -1210,7 +1200,7 @@ io.on("connection", (socket) => {
     // --- 2. Create the new subscriptions ---
     socketSubscriptions[socket.id] = contactPubKeys;
     contactPubKeys.forEach(pubKey => {
-      const key = normalizeB64(pubKey);
+      const key = normKey(pubKey);
       if (!presenceSubscriptions[key]) {
         presenceSubscriptions[key] = [];
       }
@@ -1218,8 +1208,7 @@ io.on("connection", (socket) => {
     });
 
     // --- 3. Reply with the initial online status of the subscribed contacts ---
-    // --- 3. Reply with the initial online status of the subscribed contacts ---
-    const initialOnlineContacts = contactPubKeys.filter(key => !!userSockets[normalizeB64(key)]);
+    const initialOnlineContacts = contactPubKeys.filter(key => !!userSockets[normKey(key)]);
     socket.emit("presence-initial-status", initialOnlineContacts);
   });
 
@@ -1230,8 +1219,8 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const toKey = normalizeB64(to);
-    const fromKey = normalizeB64(from);
+    const toKey = normKey(to);
+    const fromKey = normKey(from);
     const targetSocketId = userSockets[toKey];
 
     if (targetSocketId) {
@@ -1248,9 +1237,9 @@ io.on("connection", (socket) => {
 
   // Handle connection acceptance
   socket.on("accept-connection", ({ to, from }) => {
-    const targetId = userSockets[normalizeB64(to)];
+    const targetId = userSockets[normKey(to)];
     if (targetId) {
-      io.to(targetId).emit("connection-accepted", { from: normalizeB64(from) });
+      io.to(targetId).emit("connection-accepted", { from: normKey(from) });
       console.log(`✅ Connection accepted: ${from.slice(0, 12)}... → ${to.slice(0, 12)}...`);
     } else {
       console.log(`⚠️ Could not deliver acceptance to ${to.slice(0,12)} (not registered/online)`);
@@ -1260,33 +1249,33 @@ io.on("connection", (socket) => {
   // server.js - New Code
 // -- Video/Voice Call Signaling --
 socket.on("call-request", ({ to, from, callType }) => {
-    const targetId = userSockets[normalizeB64(to)];
+    const targetId = userSockets[normKey(to)];
     if (targetId) {
-        io.to(targetId).emit("incoming-call", { from: normalizeB64(from), callType });
+        io.to(targetId).emit("incoming-call", { from: normKey(from), callType });
         console.log(`📞 Call request (${callType}): ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
 });
 
 socket.on("call-accepted", ({ to, from }) => {
-    const targetId = userSockets[normalizeB64(to)];
+    const targetId = userSockets[normKey(to)];
     if (targetId) {
-        io.to(targetId).emit("call-accepted", { from: normalizeB64(from) });
+        io.to(targetId).emit("call-accepted", { from: normKey(from) });
         console.log(`✔️ Call accepted: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
 });
 
 socket.on("call-rejected", ({ to, from }) => {
-    const targetId = userSockets[normalizeB64(to)];
+    const targetId = userSockets[normKey(to)];
     if (targetId) {
-        io.to(targetId).emit("call-rejected", { from: normalizeB64(from) });
+        io.to(targetId).emit("call-rejected", { from: normKey(from) });
         console.log(`❌ Call rejected: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
 });
 
 socket.on("call-ended", ({ to, from }) => {
-    const targetId = userSockets[normalizeB64(to)];
+    const targetId = userSockets[normKey(to)];
     if (targetId) {
-        io.to(targetId).emit("call-ended", { from: normalizeB64(from) });
+        io.to(targetId).emit("call-ended", { from: normKey(from) });
         console.log(`👋 Call ended: ${from.slice(0,12)}... & ${to.slice(0,12)}...`);
     }
 });
